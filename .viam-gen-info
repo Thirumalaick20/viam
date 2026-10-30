@@ -1,0 +1,13 @@
+{
+  "module_name": "palletizer-102-4",
+  "visibility": "private",
+  "namespace": "swiftjaderobot",
+  "language": "python",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "palletizer",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-10-29T09:27:15.492852028Z",
+  "module_readme_link": "README.md"
+}
