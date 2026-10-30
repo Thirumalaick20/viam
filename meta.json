@@ -10,8 +10,6 @@
       "markdown_link": "swiftjaderobot_palletizer-102-4_palletizer.md"
     }
   ],
-  "visibility": "private",
-  "url": "",
   "description": "Modular generic service: palletizer",
   "markdown_link": "README.md",
   "entrypoint": "dist/main",
