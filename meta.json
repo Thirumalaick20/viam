@@ -1,6 +1,8 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "swiftjaderobot:palletizer-102-4",
+  "visibility": "private",
+  "url": "https://github.com/Thirumalaick20/palletizer-102",
   "models": [
     {
       "api": "rdk:service:generic",
