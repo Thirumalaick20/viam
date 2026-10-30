@@ -1,0 +1,1265 @@
+#!/usr/bin/env python3
+"""Course chores.
+
+Everything in here is bookkeeping the course needs and a Viam developer does
+not: copying a file into place, keeping two strings in a manifest agreeing with
+each other, reading a value back out. None of it is worth a learner's memory,
+and printing it on a page as a wall of Python teaches the wrong thing, so it
+lives behind names that say what it does.
+
+    course-tools setup-machine      create the machine and the course location
+    course-tools start-server       start viam-server again (never a second copy)
+    course-tools check-namespace    claim your organization's public namespace
+    course-tools check-names        make sure your module name is free
+    course-tools setup-github       sign in to GitHub and get ready to push
+    course-tools copy-starter-code  copy the starter in, keeping your model name
+    course-tools add-model          add this module's model to meta.json
+    course-tools model-id           print the model triplet
+    course-tools print-urls         print the machine's app page links
+    course-tools print-env          print the saved environment values
+    course-tools print-all          print all of the above
+    course-tools check-exercise 7   check your work on exercise 7
+    course-tools check-exercise 7.2 check just step 2 of exercise 7
+"""
+
+import argparse
+import ast
+import shutil
+import shlex
+import re
+import json
+import os
+import subprocess
+import sys
+
+# realpath, not abspath: this is run through a symlink on PATH, and its
+# siblings (setup-machine.py, the starter) live beside the real file.
+HERE = os.path.dirname(os.path.realpath(__file__))
+STARTER = os.path.join(HERE, "course-files", "palletizer-starter.py")
+sys.path.insert(0, os.path.join(HERE, "course-files"))
+import term  # noqa: E402  (needs HERE on the path first)
+RESOURCE = os.path.join("src", "models", "palletizer.py")
+MODEL_NAME = "palletizer"
+
+
+def die(msg):
+    sys.exit(f"course-tools: {msg}")
+
+
+def _prompt_with_default(prompt, default):
+    """input(), with `default` already typed on the line and editable.
+
+    A bracketed default asks the learner to know that blank means "use it".
+    readline can pre-fill the line instead, so Enter accepts and backspace
+    edits. Without a terminal there is nothing to pre-fill, and input()
+    behaves as it always did.
+    """
+    try:
+        import readline
+    except ImportError:
+        return input(f"{prompt}[{default}] ")
+    if not sys.stdin.isatty():
+        return input(prompt) or default
+
+    def preload():
+        readline.insert_text(default)
+        readline.redisplay()
+
+    readline.set_startup_hook(preload)
+    try:
+        return input(prompt)
+    finally:
+        readline.set_startup_hook()
+
+
+def load_meta():
+    if not os.path.exists("meta.json"):
+        die("no meta.json here. Run this from inside your module directory, "
+            "the one `viam module generate` made.")
+    try:
+        with open("meta.json") as f:
+            meta = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"meta.json does not parse: {e}. A missing comma or a stray one "
+            "is the usual cause; fix it in the Editor and rerun this.")
+    if ":" not in meta.get("module_id", ""):
+        die(f"meta.json has an odd module_id: {meta.get('module_id')!r}")
+    namespace, module = meta["module_id"].split(":", 1)
+    return meta, namespace, module
+
+
+def cmd_setup_machine(argv):
+    """Delegate to the machine setup script, passing its flags through."""
+    script = os.path.join(HERE, "course-files", "setup-machine.py")
+    raise SystemExit(subprocess.call([sys.executable, script] + argv))
+
+
+def cmd_check_namespace(argv):
+    """Make sure the organization has a public namespace, claiming one if not.
+
+    Registering a module requires the organization to have claimed a public
+    namespace, and a fresh personal organization has none: `viam module
+    generate` walks all of its prompts and then refuses at the very end.
+    Checking here fails fast, and turns the fix into one prompt.
+    """
+    import re
+
+    ap = argparse.ArgumentParser(prog="course-tools check-namespace")
+    ap.add_argument("--org", help="organization id (default: the one "
+                    "setup-machine saved)")
+    args = ap.parse_args(argv)
+    org_id = args.org or read_env().get("VIAM_102_ORG_ID")
+    if not org_id:
+        die("no organization recorded; run `course-tools setup-machine` "
+            "first or pass --org")
+
+    def viam(cli_args):
+        p = subprocess.run(["viam"] + cli_args, capture_output=True, text=True)
+        if p.returncode != 0:
+            die(f"`viam {' '.join(cli_args)}` failed: "
+                f"{(p.stderr or p.stdout).strip()}")
+        return p.stdout
+
+    def suggest():
+        """A memorable default with nothing personal in it.
+
+        The namespace is public, so the default must not leak a name
+        or an email, and learners find it again in the registry later,
+        so it should be memorable: adjective + color + a robot word,
+        picked deterministically from the organization id. The
+        platform requires lowercase, so braveyellowdroid, not
+        braveYellowDroid.
+        """
+        sizes = ["little", "brave", "happy", "swift", "quiet", "clever",
+                 "mighty", "gentle", "lucky", "shiny", "sunny", "zippy",
+                 "calm", "bold", "witty", "spry"]
+        colors = ["red", "orange", "yellow", "green", "blue", "purple",
+                  "silver", "golden", "copper", "teal", "coral", "amber",
+                  "violet", "crimson", "jade", "pearl"]
+        robots = ["robot", "droid", "bot", "automaton", "machine",
+                  "mech", "rover", "android"]
+        h = re.sub(r"[^0-9a-f]", "", org_id.lower())
+        return (sizes[int(h[:4], 16) % 16]
+                + colors[int(h[4:8], 16) % 16]
+                + robots[int(h[8:12], 16) % 8])
+
+    async def run():
+        from viam.app.viam_client import ViamClient
+        from viam.rpc.dial import DialOptions, Credentials
+
+        raw = viam(["organizations", "api-key", "create", "--org-id", org_id,
+                    "--name", "viam-102-namespace-check"])
+        kid = re.search(r"Key ID:\s*(\S+)", raw)
+        kval = re.search(r"Key Value:\s*(\S+)", raw)
+        if not (kid and kval):
+            die("could not read the new API key from the CLI output; claim a "
+                "namespace in the app instead, under organization settings")
+        key_id, key_val = kid.group(1), kval.group(1)
+        client = await ViamClient.create_from_dial_options(DialOptions(
+            credentials=Credentials(type="api-key", payload=key_val),
+            auth_entity=key_id))
+        try:
+            app = client.app_client
+            orgs = await app.list_organizations()
+            org = next((o for o in orgs if o.id == org_id), None)
+            if org is None:
+                die(f"organization {org_id} not found for this login")
+            if org.public_namespace:
+                save_env("VIAM_102_NAMESPACE", org.public_namespace)
+                print(f"public namespace: {org.public_namespace} "
+                      "(already claimed, nothing to do)")
+                return
+
+            candidate = suggest()
+            while candidate and not await                     app.get_organization_namespace_availability(candidate):
+                candidate += "102"
+
+            print(f"Your organization ({org.name}) has no public namespace.")
+            print("Module IDs live under it, like namespace:palletizer-102.")
+            print("It is PUBLIC and PERMANENT, so pick deliberately, and")
+            print("only put your name in it if you want it public. A")
+            print("username you already use elsewhere works well; the")
+            print("suggestion is an anonymous fallback.")
+            print("Lowercase letters and digits only.")
+            while True:
+                try:
+                    picked = _prompt_with_default(
+                        "Public namespace: ", candidate).strip()
+                except EOFError:
+                    picked = ""
+                picked = picked or candidate
+                if not re.fullmatch(r"[a-z][a-z0-9]*", picked or ""):
+                    print("lowercase letters and digits only, starting "
+                          "with a letter; try again")
+                    continue
+                if not await                         app.get_organization_namespace_availability(picked):
+                    print(f"{picked} is taken; try another")
+                    continue
+                break
+            await app.update_organization(org_id, public_namespace=picked)
+            save_env("VIAM_102_NAMESPACE", picked)
+            print(f"public namespace claimed: {picked}")
+        finally:
+            try:
+                await app.delete_key(key_id)
+            except Exception:
+                print(f"note: could not revoke the check key {key_id}; "
+                      "delete it in the app under organization settings")
+            client.close()
+
+    import asyncio
+    asyncio.run(run())
+
+
+# The course's module name. Pages show it, and their Editor links open files
+# under ~/exercises/palletizer-102, which copy-starter-code keeps pointing at
+# the learner's module when check-names had to pick another name.
+DEFAULT_MODULE = "palletizer-102"
+EXERCISES_DIR = os.path.expanduser("~/exercises")
+# `viam module generate`'s own rule for a module name (rdk cli/module_generate.go).
+MODULE_NAME_RE = r"[a-zA-Z]+(?:[_\-a-zA-Z0-9]+)*"
+# GitHub's rule for a repository name; "." and ".." are refused.
+REPO_NAME_RE = r"(?!\.{1,2}$)[A-Za-z0-9._-]{1,100}"
+
+
+def _local_module(name, namespace):
+    """What ~/exercises/<name> is: "yours", "taken" or None (nothing there).
+
+    "yours" is a module this learner generated under this namespace, which a
+    returning learner's restored home holds; it must never read as a clash.
+    """
+    path = os.path.join(EXERCISES_DIR, name)
+    try:
+        with open(os.path.join(path, "meta.json")) as f:
+            if json.load(f).get("module_id") == f"{namespace}:{name}":
+                return "yours"
+    except (OSError, ValueError, AttributeError):
+        pass
+    return "taken" if os.path.lexists(path) else None
+
+
+async def _registered(app, module_id):
+    """The registry's module for `module_id`, or None when there is none."""
+    from grpclib.const import Status
+    from grpclib.exceptions import GRPCError
+    try:
+        return await app.get_module(module_id)
+    except GRPCError as e:
+        if e.status == Status.NOT_FOUND:
+            return None
+        raise
+
+
+async def _module_state(app, name, namespace):
+    """("yours" | "free" | "registered" | "local", registry module or None)."""
+    local = _local_module(name, namespace)
+    if local == "yours":
+        return "yours", None
+    module = await _registered(app, f"{namespace}:{name}")
+    if module is not None:
+        return "registered", module
+    return ("local" if local else "free"), None
+
+
+def _next_names(name, default):
+    """palletizer-102 -> palletizer-102-2, -3, ...; any other name -> name-2, ..."""
+    m = re.fullmatch(rf"({re.escape(default)})(?:-\d+)?", name)
+    base = m.group(1) if m else name
+    return (f"{base}-{i}" for i in range(2, 100))
+
+
+def _ask_name(prompt, suggestion, pattern, rule, ask):
+    """Prompt until the learner accepts the suggestion or types a valid name.
+
+    Enter takes the pre-filled suggestion; so does end of input, so a piped
+    run still finishes. Whether the name is free is the caller's check.
+    """
+    while True:
+        try:
+            picked = ask(prompt, suggestion).strip()
+        except EOFError:
+            print()
+            picked = ""
+        picked = picked or suggestion
+        if re.fullmatch(pattern, picked):
+            return picked
+        print(rule)
+
+
+def choose_module_name(state_of, namespace, name, ask):
+    """Return a module name that `viam module generate` can register.
+
+    `state_of(name)` is _module_state for one name. The prompts stay out of
+    the event loop: inside asyncio.run the first Ctrl-C only cancels the task
+    while input() keeps waiting, and the second is a traceback.
+    """
+    state, module = state_of(name)
+    if state == "yours":
+        print(f"module name: {term.cyan(name)} (your module from earlier in "
+              f"the course, in ~/exercises/{name})")
+        return name
+    if state == "free":
+        print(f"module name: {term.cyan(name)} (free in {namespace})")
+        return name
+
+    if state == "registered":
+        versions = [v.version for v in module.versions]
+        print(term.yellow(
+            f"{namespace}:{name} is already registered in your organization"
+            + (f" (versions {', '.join(versions)})" if versions else "") + "."))
+        print("It is left from an earlier run of this course, or a teammate in")
+        print("the same organization made it. A module can be registered only")
+        print("once, so use a different module name for this course.")
+    else:
+        print(term.yellow(f"~/exercises/{name} already exists and is not your "
+                          f"{namespace}:{name} module."))
+        print("`viam module generate` will not create a module over it, so use")
+        print("a different module name for this course.")
+
+    suggestion = None
+    for candidate in _next_names(name, DEFAULT_MODULE):
+        if state_of(candidate)[0] in ("free", "yours"):
+            suggestion = candidate
+            break
+    if suggestion is None:
+        die("could not find a free module name to suggest; pass one with "
+            "`course-tools check-names --module <name>`")
+
+    while True:
+        picked = _ask_name("Module name: ", suggestion, MODULE_NAME_RE,
+                           "letters, digits, dashes and underscores only, "
+                           "starting with a letter", ask)
+        state, _ = state_of(picked)
+        if state in ("free", "yours"):
+            print(f"module name: {term.cyan(picked)}")
+            return picked
+        print(f"{picked}: " + ("already registered in your organization"
+                               if state == "registered"
+                               else f"~/exercises/{picked} already exists")
+              + "; try another")
+
+
+def _start_name(explicit, saved, namespace):
+    """The module name to check first.
+
+    The one asked for, else the saved one, else the module that
+    ~/exercises/palletizer-102 links to (the env file can be lost while the
+    link copy-starter-code made survives), else the course's.
+    """
+    if explicit or saved:
+        return explicit or saved
+    link = os.path.join(EXERCISES_DIR, DEFAULT_MODULE)
+    if os.path.islink(link):
+        target = os.path.basename(os.path.realpath(link))
+        if _local_module(target, namespace) == "yours":
+            return target
+    return DEFAULT_MODULE
+
+
+async def _open_registry(token):
+    """(channel, app client) that read as the CLI's logged-in user."""
+    from grpclib.client import Channel
+    from viam.app.app_client import AppClient
+    channel = Channel("app.viam.com", 443, ssl=True)
+    return channel, AppClient(channel, {"authorization": f"Bearer {token}"})
+
+
+def cmd_check_names(argv):
+    """Make sure the course's module name is free before the module is made.
+
+    A module name is registered once per organization. A learner retaking the
+    course, or a teammate in the same organization, already holds
+    `<namespace>:palletizer-102`, and `viam module generate` then fails at the
+    very end with nothing on the page saying why. Checking here, right after
+    the namespace is known, turns that into one prompt with a free name.
+
+    Reads through the CLI's own login: nothing is created in the organization.
+    """
+    ap = argparse.ArgumentParser(prog="course-tools check-names")
+    ap.add_argument("--module", help="module name to check (default: the "
+                    f"saved one, else {DEFAULT_MODULE})")
+    args = ap.parse_args(argv)
+    env = read_env()
+    namespace = env.get("VIAM_102_NAMESPACE")
+    if not namespace:
+        die("no public namespace recorded; run `course-tools check-namespace "
+            "&& source ~/.viam-102-env` first")
+    name = _start_name(args.module, env.get("VIAM_102_MODULE"), namespace)
+    if not re.fullmatch(MODULE_NAME_RE, name):
+        die(f"{name!r} is not a valid module name: letters, digits, dashes and "
+            "underscores only, starting with a letter")
+
+    try:
+        p = subprocess.run(["viam", "login", "print-access-token"],
+                           capture_output=True, text=True)
+    except FileNotFoundError:
+        die("the Viam CLI is not installed; run the curl and chmod commands "
+            "at the top of this page, then `viam login`")
+    token = p.stdout.strip()
+    if p.returncode != 0 or not token:
+        die("the Viam CLI is not logged in; run `viam login`, then this again")
+
+    import asyncio
+    from grpclib.exceptions import GRPCError
+    loop = asyncio.new_event_loop()
+    channel = None
+    try:
+        channel, app = loop.run_until_complete(_open_registry(token))
+        picked = choose_module_name(
+            lambda n: loop.run_until_complete(_module_state(app, n, namespace)),
+            namespace, name, _prompt_with_default)
+    except GRPCError as e:
+        from grpclib.const import Status
+        hint = ("; run `viam login`, then this again"
+                if e.status in (Status.UNAUTHENTICATED, Status.PERMISSION_DENIED)
+                else "")
+        die(f"could not check the registry: {e.message or e.status.name}{hint}")
+    except OSError as e:
+        # grpclib connects on the first call and re-raises socket and TLS errors
+        # as they are, so an unreachable app.viam.com is not a GRPCError.
+        die(f"could not reach app.viam.com ({e.strerror or e}); check this "
+            "session's network, then run this again")
+    except KeyboardInterrupt:
+        print()
+        die("stopped; no module name was saved")
+    finally:
+        if channel is not None:
+            channel.close()
+        loop.close()
+    save_env("VIAM_102_MODULE", picked)
+    # What check 2.4 looks for: an env file written before check-names
+    # existed already holds VIAM_102_MODULE, with nothing having checked it.
+    save_env("VIAM_102_MODULE_CHECKED", picked)
+    print(f"saved VIAM_102_MODULE={picked} to ~/.viam-102-env")
+    print("The GitHub repository name is checked later, on the cloud build "
+          "page, once you sign in to GitHub.")
+
+
+def cmd_setup_github(_argv):
+    """Sign in to GitHub and make this module directory ready to push.
+
+    Four chores, none worth a learner's memory: the gh device-code
+    sign-in, teaching git to push with that sign-in, setting the commit
+    identity from it (username and GitHub's no-reply address, so no
+    personal email lands in commits), and removing the generated
+    .github workflow, a release automation the course does not use.
+    """
+    def gh(*args, capture=False):
+        if capture:
+            p = subprocess.run(["gh"] + list(args),
+                               capture_output=True, text=True)
+            return p.returncode, p.stdout.strip()
+        return subprocess.call(["gh"] + list(args)), ""
+
+    if not os.path.exists("meta.json"):
+        die("no meta.json here. Run this from inside your module "
+            "directory, the one `viam module generate` made.")
+
+    code, _ = gh("auth", "status", capture=True)
+    if code == 0:
+        print("GitHub: already signed in")
+    else:
+        code, _ = gh("auth", "login", "--hostname", "github.com",
+                     "--git-protocol", "https", "--web")
+        if code != 0:
+            die("GitHub sign-in did not finish; run "
+                "`course-tools setup-github` again")
+    gh("auth", "setup-git", capture=True)
+
+    _, login = gh("api", "user", "-q", ".login", capture=True)
+    _, uid = gh("api", "user", "-q", ".id", capture=True)
+    if not (login and uid):
+        die("could not read your GitHub username; run "
+            "`course-tools setup-github` again")
+    email = f"{uid}+{login}@users.noreply.github.com"
+    subprocess.call(["git", "config", "--global", "user.name", login])
+    subprocess.call(["git", "config", "--global", "user.email", email])
+    print(f"git identity: {login} <{email}>")
+
+    if os.path.isdir(".github"):
+        import shutil
+        shutil.rmtree(".github")
+        print("removed .github: the generated release workflow, "
+              "which this course does not use")
+    else:
+        print(".github: already gone")
+
+    # Signing in is the first moment the GitHub account is known, so this is
+    # the earliest the repository name can be checked.
+    _meta, _namespace, module = load_meta()
+    saved = read_env()["VIAM_102_REPO"] if _env_has("VIAM_102_REPO") else None
+    origin = subprocess.run(["git", "remote", "get-url", "origin"],
+                            capture_output=True, text=True).stdout.strip()
+    try:
+        repo = choose_repo_name(login,
+                                _repo_start_name(saved, module, login, origin),
+                                lambda name: _repo_exists(login, name), origin,
+                                _prompt_with_default)
+    except KeyboardInterrupt:
+        print()
+        die("stopped; no repository name was saved")
+    save_env("VIAM_102_REPO", repo)
+    print(f"repository: {term.cyan(f'https://github.com/{login}/{repo}')}")
+    print("  saved as VIAM_102_REPO; that address is the url meta.json gets")
+
+
+def _same_repo(origin, login, name):
+    """Whether git's origin URL is github.com/<login>/<name>."""
+    return origin.removesuffix(".git") == f"https://github.com/{login}/{name}"
+
+
+def _repo_start_name(saved, module, login, origin):
+    """The saved repository name while this directory pushes to it, else the
+    module's name. A name saved for a module since generated again under
+    another name must not win over the module in front of the learner."""
+    return saved if saved and _same_repo(origin, login, saved) else module
+
+
+def _repo_exists(login, name):
+    """Whether github.com/<login>/<name> exists.
+
+    Anything but a clear yes or no stops the command: guessing "free" only
+    moves the failure to `gh repo create`.
+    """
+    p = subprocess.run(["gh", "api", f"repos/{login}/{name}", "--silent"],
+                       capture_output=True, text=True)
+    if p.returncode == 0:
+        return True
+    if "HTTP 404" in p.stderr:
+        return False
+    die(f"could not ask GitHub about {login}/{name}: {p.stderr.strip()}")
+
+
+def choose_repo_name(login, name, exists, origin, ask):
+    """Return a repository name `gh repo create` can use for this module.
+
+    The module's own name, unless the GitHub account already has a repository
+    by that name. The repository this directory already pushes to is the
+    learner's, from an earlier pass through the page, and never a clash.
+    """
+    def usable(candidate):
+        if not exists(candidate):
+            return True
+        return _same_repo(origin, login, candidate)
+
+    if usable(name):
+        return name
+    print(term.yellow(f"github.com/{login}/{name} already exists."))
+    print("It is left from an earlier run of this course, or it is another")
+    print("project of yours. Use a different repository name for this course.")
+    suggestion = next((c for c in _next_names(name, DEFAULT_MODULE)
+                       if usable(c)), None)
+    if suggestion is None:
+        die("could not find a free repository name to suggest")
+    while True:
+        picked = _ask_name("Repository name: ", suggestion, REPO_NAME_RE,
+                           "letters, digits, dots, dashes and underscores "
+                           "only", ask)
+        if usable(picked):
+            return picked
+        print(f"{picked}: github.com/{login}/{picked} already exists; "
+              "try another")
+
+
+def _link_course_path():
+    """Make the pages' Editor links reach this module when its name differs.
+
+    An Editor link on a page names a literal path, ~/exercises/palletizer-102/...,
+    and cannot read $VIAM_102_MODULE. When check-names picked another name, a
+    link ~/exercises/palletizer-102 -> <that name> sends every one of them to
+    the learner's module. Relative, so it still resolves after the session
+    archive brings the home directory back.
+    """
+    here = os.path.realpath(os.getcwd())
+    if os.path.dirname(here) != os.path.realpath(EXERCISES_DIR):
+        return
+    name = os.path.basename(here)
+    link = os.path.join(EXERCISES_DIR, DEFAULT_MODULE)
+    if name == DEFAULT_MODULE:
+        return
+    if os.path.islink(link) and not os.path.exists(link):
+        os.unlink(link)  # dangling: the directory it named is gone
+    if os.path.islink(link) and os.path.realpath(link) == here:
+        return
+    if os.path.lexists(link):
+        print(term.yellow(
+            f"note: ~/exercises/{DEFAULT_MODULE} is a different directory, so "
+            "the Editor links on the pages open files there, not in your "
+            f"module. Open your files from ~/exercises/{name} in the Editor's "
+            "file list instead."))
+        return
+    os.symlink(name, link)
+    print(f"  Linked ~/exercises/{DEFAULT_MODULE} -> {name}, so the Editor "
+          "links on the pages open your module")
+
+
+def cmd_take_starter(_argv):
+    """Copy the course starter over the generated resource file.
+
+    The starter names a placeholder namespace, and the generated file it
+    replaces named the real one, so the model family is restored from the
+    manifest rather than retyped.
+    """
+    meta, namespace, module = load_meta()
+    if not os.path.exists(RESOURCE):
+        die(f"no {RESOURCE} here. Run this from inside your module directory.")
+    with open(STARTER) as f:
+        body = f.read()
+    body = body.replace('ModelFamily("your-namespace", "palletizer-102")',
+                        f'ModelFamily("{namespace}", "{module}")')
+    with open(RESOURCE, "w") as f:
+        f.write(body)
+    print(f"{term.bold('Copying the starter code')} - {term.green('FINISHED')}")
+    print(f"{RESOURCE} is now the course starter")
+    print(f"  Using the model family: {term.cyan(f'{namespace}:{module}')}")
+    _link_course_path()
+    # The generate prompt is editable, so the name typed there wins over the
+    # one check-names saved; later pages cd by the saved one.
+    save_env("VIAM_102_MODULE", module)
+
+
+def cmd_describe_model(_argv):
+    """Add this module's model to meta.json, so the registry can list it."""
+    meta, namespace, module = load_meta()
+    meta["models"] = [{
+        "api": "rdk:service:generic",
+        "model": f"{namespace}:{module}:{MODEL_NAME}",
+        "markdown_link": f"{namespace}_{module}_{MODEL_NAME}.md",
+    }]
+    meta.setdefault("description",
+                    "Picks boxes from a pick-station and stacks them on a pallet.")
+    with open("meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+        f.write("\n")
+    save_env("VIAM_102_MODULE", module)
+    print("meta.json now describes one model:")
+    print(json.dumps(meta["models"][0], indent=2))
+
+
+def save_env(key, value):
+    """Add or update one export line in ~/.viam-102-env."""
+    env = os.path.expanduser("~/.viam-102-env")
+    lines = open(env).readlines() if os.path.exists(env) else []
+    lines = [ln if ln.endswith("\n") else ln + "\n" for ln in lines]
+    lines = [ln for ln in lines if not ln.startswith(f"export {key}=")]
+    lines.append(f"export {key}={shlex.quote(str(value))}\n")
+    open(env, "w").writelines(lines)
+
+
+def read_env():
+    env = os.path.expanduser("~/.viam-102-env")
+    if not os.path.exists(env):
+        die("no machine yet: run `course-tools setup-machine` first")
+    values = {}
+    for line in open(env):
+        if line.startswith("export ") and "=" in line:
+            k, v = line[len("export "):].split("=", 1)
+            values[k.strip()] = _unquote(v)
+    return values
+
+
+def _unquote(value):
+    """The value of an `export KEY=<value>` line, as the shell reads it."""
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        return value.strip().strip('"')
+    return words[0] if words else ""
+
+
+def cmd_print_urls(_argv):
+    """Print the machine's app pages. The terminal makes them clickable."""
+    machine_id = read_env().get("VIAM_102_MACHINE_ID")
+    if not machine_id:
+        die("the machine id is not recorded yet; run `course-tools setup-machine` "
+            "once more to refresh it")
+    print(f"CONFIGURE : https://app.viam.com/machine/{machine_id}/configure")
+    print(f"3D SCENE  : https://app.viam.com/machine/{machine_id}/3d-scene")
+
+
+def cmd_print_env(_argv):
+    """Print the values setup-machine saved, ready to eyeball or source."""
+    for k, v in sorted(read_env().items()):
+        print(f"{k}={v}")
+
+
+def cmd_print_all(argv):
+    cmd_print_env(argv)
+    print()
+    cmd_print_urls(argv)
+
+
+def cmd_namespace(_argv):
+    """Print the namespace half of the module id, on its own."""
+    _meta, namespace, _module = load_meta()
+    print(namespace)
+
+
+def cmd_model_id(_argv):
+    _meta, namespace, module = load_meta()
+    print(f"{namespace}:{module}:{MODEL_NAME}")
+
+
+def cmd_check(_argv):
+    """Report what is wired up and what is still a stub."""
+    _meta, namespace, module = load_meta()
+    if not os.path.exists(RESOURCE):
+        die(f"no {RESOURCE} here. Run this from inside your module directory.")
+    src = open(RESOURCE).read()
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as e:
+        print(f"  SYNTAX ERROR in {RESOURCE}, line {e.lineno}:")
+        print(f"    {(e.text or '').rstrip()}")
+        print(f"    {e.msg}")
+        print("  Fix this line before reloading: a module with a syntax")
+        print("  error deploys, then crashes on the machine with a")
+        print("  misleading 'No module named models.palletizer'.")
+        sys.exit(1)
+
+    def stubbed(name):
+        for node in ast.walk(tree):
+            if getattr(node, "name", "") == name:
+                body = [n for n in node.body
+                        if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+                return len(body) == 1 and isinstance(body[0], ast.Raise)
+        return None
+
+    ok = True
+    family = f'ModelFamily("{namespace}", "{module}")'
+    if family in src:
+        print(f"  model family matches meta.json  ({namespace}:{module})")
+    else:
+        ok = False
+        print(f"  MODEL FAMILY does not match meta.json; expected {family}")
+
+    for verb in ("do_command", "place", "pack"):
+        state = stubbed(verb)
+        if state is None:
+            ok = False
+            print(f"  {verb} is missing from {RESOURCE}")
+        else:
+            print(f"  {verb}: {'still a stub' if state else 'written'}")
+
+    models = _meta.get("models") or []
+    want = f"{namespace}:{module}:{MODEL_NAME}"
+    if not models:
+        ok = False
+        print("  meta.json has no models list yet")
+    elif models[0].get("model") != want:
+        ok = False
+        print(f"  meta.json model is {models[0].get('model')!r}; expected {want}")
+    else:
+        print(f"  meta.json lists the model  ({want})")
+
+    validate_src = src.split("def validate_config")[-1].split("def ")[0]
+    deps = bool(re.search(r"\bPALLET\b", validate_src))
+    print(f"  pallet declared as a dependency: {'yes' if deps else 'not yet'}")
+
+    # A method pasted one indent too deep lands INSIDE the method above it.
+    # That parses, so the syntax check above says nothing, and the failure
+    # only shows up on the machine as a bare AttributeError. Catch it here.
+    cls = next((n for n in ast.walk(tree)
+                if isinstance(n, ast.ClassDef) and n.name == "Palletizer"), None)
+    if cls is not None:
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+        top = {n.name for n in cls.body if isinstance(n, defs)}
+        nested = {}
+        for method in (n for n in cls.body if isinstance(n, defs)):
+            for inner in ast.walk(method):
+                if inner is not method and isinstance(inner, defs):
+                    nested.setdefault(inner.name, (inner.lineno, method.name))
+        do_cmd = next((n for n in cls.body
+                       if isinstance(n, defs) and n.name == "do_command"), None)
+        for node in ast.walk(do_cmd) if do_cmd else ():
+            func = getattr(node, "func", None)
+            if (isinstance(node, ast.Call)
+                    and isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "self"
+                    and func.attr not in top
+                    and func.attr in nested):
+                line, parent = nested[func.attr]
+                ok = False
+                print(f"  do_command routes to self.{func.attr}(), but that")
+                print(f"  method is defined INSIDE {parent}() on line {line}.")
+                print(f"  Outdent `async def {func.attr}` so it lines up with")
+                print("  `async def pick`, four spaces in.")
+
+    if not ok:
+        sys.exit(1)
+
+
+# --------------------------------------------------------------- exercises
+# One numbered check per thing a page asked the learner to do, so
+# `course-tools check-exercise 7.1` answers "did I get TODO 1 right?" and
+# nothing else. `check-module` still runs the whole sweep; the pages use the
+# numbered form because a learner mid-exercise wants one answer, not fifteen.
+#
+# Exercises 4 and 10 have no checks here on purpose: what they ask for lives
+# in the registry and on GitHub, and a check that has to authenticate and
+# call the cloud fails for reasons that have nothing to do with the
+# learner's work.
+
+
+def _source():
+    """The learner's resource file, parsed. Returns (src, tree)."""
+    if not os.path.exists(RESOURCE):
+        die(f"no {RESOURCE} here. Run this from inside your module directory.")
+    src = open(RESOURCE).read()
+    try:
+        return src, ast.parse(src)
+    except SyntaxError as e:
+        print(f"  {term.red('SYNTAX ERROR')} in {RESOURCE}, line {e.lineno}:")
+        print(f"    {(e.text or '').rstrip()}")
+        print(f"    {e.msg}")
+        sys.exit(1)
+
+
+def _class(tree):
+    return next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.ClassDef) and n.name == "Palletizer"),
+                None)
+
+
+def _method(tree, name):
+    """The method as a class-level def, or None if it is missing or nested."""
+    cls = _class(tree)
+    if cls is None:
+        return None
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+    return next((n for n in cls.body if isinstance(n, defs) and n.name == name),
+                None)
+
+
+def _is_stub(node):
+    body = [n for n in node.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    return len(body) == 1 and isinstance(body[0], ast.Raise)
+
+
+def _method_src(tree, name):
+    node = _method(tree, name)
+    return ast.unparse(node) if node is not None else ""
+
+
+def _routes(tree, verb):
+    """Every self.<attr>() the `if verb == "<verb>"` branch calls.
+
+    A set, not the first one found: a learner who prints something through
+    self before returning has still routed the verb correctly, and the
+    first version of this failed them for it. None means there is no
+    branch for the verb at all, which is a different answer from "the
+    branch is there and calls the wrong thing".
+    """
+    node = _method(tree, "do_command")
+    if node is None:
+        return None
+    for test in ast.walk(node):
+        if not isinstance(test, ast.If):
+            continue
+        cmp_ = test.test
+        if not (isinstance(cmp_, ast.Compare)
+                and cmp_.comparators
+                and isinstance(cmp_.comparators[0], ast.Constant)
+                and cmp_.comparators[0].value == verb):
+            continue
+        called = set()
+        for call in ast.walk(test):
+            func = getattr(call, "func", None)
+            if (isinstance(call, ast.Call) and isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "self"):
+                called.add(func.attr)
+        return called
+    return None
+
+
+def _env_has(key):
+    """read_env() dies when the file is missing; a check wants a row."""
+    if not os.path.exists(os.path.expanduser("~/.viam-102-env")):
+        return False
+    return bool(read_env().get(key))
+
+
+def _ok(msg):
+    return True, [msg]
+
+
+def _no(msg, *hints):
+    return False, [msg] + list(hints)
+
+
+# --- exercise 2: the CLI and your machine
+
+
+def _c21():
+    """the Viam CLI is installed and on your PATH"""
+    path = shutil.which("viam")
+    if path:
+        return _ok(f"viam is at {path}")
+    return _no("viam is not on your PATH",
+               "Re-run the curl and chmod commands on this page.")
+
+
+def _c22():
+    """your machine exists and its part id is saved"""
+    if _env_has("VIAM_102_PART_ID"):
+        return _ok(f"part id {read_env()['VIAM_102_PART_ID']}")
+    return _no("no machine recorded in ~/.viam-102-env",
+               "Run: course-tools setup-machine && source ~/.viam-102-env")
+
+
+def _c23():
+    """your organization has a public namespace"""
+    if _env_has("VIAM_102_NAMESPACE"):
+        return _ok(f"namespace {read_env()['VIAM_102_NAMESPACE']}")
+    return _no("no public namespace recorded",
+               "Run: course-tools check-namespace && source ~/.viam-102-env")
+
+
+def _c24():
+    """your module name is checked"""
+    env = read_env() if _env_has("VIAM_102_MODULE") else {}
+    module = env.get("VIAM_102_MODULE")
+    namespace = env.get("VIAM_102_NAMESPACE", "")
+    if module and (env.get("VIAM_102_MODULE_CHECKED") == module
+                   or _local_module(module, namespace) == "yours"):
+        return _ok(f"module name {module}")
+    return _no("module name not checked yet" if module
+               else "no module name recorded",
+               "Run: course-tools check-names && source ~/.viam-102-env")
+
+
+# --- exercise 3: create your module
+
+
+def _c31():
+    """meta.json lists your model"""
+    meta, namespace, module = load_meta()
+    want = f"{namespace}:{module}:{MODEL_NAME}"
+    models = meta.get("models") or []
+    if not models:
+        return _no("meta.json has no models list yet",
+                   "Add the models entry after the module_id line.")
+    if models[0].get("model") != want:
+        return _no(f"meta.json model is {models[0].get('model')!r}",
+                   f"Expected {want}.",
+                   "course-tools add-model rewrites it from the module id.")
+    return _ok(want)
+
+
+def _c32():
+    """palletizer.py names the same model family as meta.json"""
+    _meta, namespace, module = load_meta()
+    src, _tree = _source()
+    family = f'ModelFamily("{namespace}", "{module}")'
+    if family in src:
+        return _ok(f"{namespace}:{module}")
+    return _no(f"{RESOURCE} does not name {family}",
+               "course-tools copy-starter-code sets it from meta.json.")
+
+
+def _c33():
+    """meta.json's module is the name the later pages use"""
+    _meta, _namespace, module = load_meta()
+    saved = read_env()["VIAM_102_MODULE"] if _env_has("VIAM_102_MODULE") else None
+    if saved == module:
+        return _ok(f"VIAM_102_MODULE={module}")
+    return _no(f"meta.json's module is {module}, but ~/.viam-102-env has "
+               f"{saved or 'no module name'}",
+               f"Run: course-tools check-names --module {module} "
+               "&& source ~/.viam-102-env")
+
+
+# --- exercise 5: DoCommand
+
+
+def _c51():
+    """do_command routes pick"""
+    return _routed("pick")
+
+
+# --- exercise 6: add a dependency
+
+
+def _c61():
+    """validate_config declares the pallet"""
+    if re.search(r"\bPALLET\b", _method_src(_source()[1], "validate_config")):
+        return _ok("PALLET is in the required list")
+    return _no("validate_config does not mention PALLET",
+               "Add PALLET to the list of names it returns.")
+
+
+def _c62():
+    """the constructor resolves the pallet"""
+    if re.search(r"self\.pallet\s*=", _method_src(_source()[1], "new")):
+        return _ok("new stores self.pallet")
+    return _no("new never assigns self.pallet",
+               "Look it up with dependencies.get(...) and store it.")
+
+
+def _c63():
+    """status reports the pallet"""
+    if re.search(r"\bPALLET\b", _method_src(_source()[1], "status")):
+        return _ok("PALLET is in the held dict")
+    return _no("status does not report PALLET",
+               "Add PALLET: self.pallet, to the held dictionary.")
+
+
+# --- exercises 7 and 8: write place, write pack
+
+
+# What each verb's finished body has to contain. "Not a stub" is not enough:
+# the skeleton this page hands over is not a stub either, so a learner who
+# pasted it and wrote none of the TODOs used to be told "place is written".
+WANTED = {
+    "place": [
+        (lambda b: b["calls"].count("self.move_gripper") >= 2,
+         "TODO 1 and TODO 2: two self.move_gripper(...) calls"),
+        (lambda b: "self.gripper.open" in b["calls"],
+         "TODO 3: await self.gripper.open()"),
+    ],
+    "pack": [
+        (lambda b: "self.clear_boxes" in b["calls"],
+         "TODO 1: await self.clear_boxes()"),
+        (lambda b: b["assigns_placed"],
+         "TODO 1: self.placed = []"),
+        (lambda b: b["loops_place"],
+         "TODO 2: a loop calling await self.place()"),
+    ],
+}
+
+
+def _body_facts(node):
+    """The few things WANTED asks about, gathered in one walk."""
+    calls = []
+    for n in ast.walk(node):
+        func = getattr(n, "func", None)
+        if isinstance(n, ast.Call) and isinstance(func, ast.Attribute):
+            calls.append(ast.unparse(func))
+    assigns_placed = any(
+        isinstance(n, ast.Assign)
+        and any(ast.unparse(t) == "self.placed" for t in n.targets)
+        for n in ast.walk(node))
+    loops = (ast.For, ast.AsyncFor, ast.While)
+    loops_place = any(
+        any(isinstance(c, ast.Call)
+            and isinstance(getattr(c, "func", None), ast.Attribute)
+            and ast.unparse(c.func) == "self.place"
+            for c in ast.walk(loop))
+        for loop in ast.walk(node) if isinstance(loop, loops))
+    return {"calls": calls, "assigns_placed": assigns_placed,
+            "loops_place": loops_place}
+
+
+def _written(verb):
+    node = _method(_source()[1], verb)
+    if node is None:
+        return _no(f"{verb} is not a method of Palletizer",
+                   f"Check the indentation: async def {verb} lines up with"
+                   " async def pick.")
+    if _is_stub(node):
+        return _no(f"{verb} is still the stub that raises NotImplementedError",
+                   f"Replace the whole {verb} stub with the skeleton on this"
+                   " page.")
+    missing = [why for ok, why in WANTED[verb] if not ok(_body_facts(node))]
+    if missing:
+        return _no(f"{verb} still has empty TODOs",
+                   *[f"missing {m}" for m in missing])
+    return _ok(f"{verb} is written")
+
+
+def _routed(verb):
+    called = _routes(_source()[1], verb)
+    if called is None:
+        return _no(f'do_command has no branch for "{verb}"',
+                   "Paste the dispatch lines under # Route new verbs here.")
+    if verb in called:
+        return _ok(f"{verb} -> self.{verb}()")
+    if called:
+        return _no(f"the {verb} branch calls "
+                   f"self.{'(), self.'.join(sorted(called))}(), "
+                   f"but never self.{verb}()")
+    return _no(f'the "{verb}" branch calls nothing on self')
+
+
+# --- exercise 9: attributes and validation
+
+ATTRS = ("columns", "rows", "layers", "box_height_mm")
+
+
+def _c91():
+    """validate_config checks all four attributes"""
+    body = _method_src(_source()[1], "validate_config")
+    missing = [a for a in ATTRS if a not in body]
+    if missing:
+        return _no(f"validate_config never mentions {', '.join(missing)}")
+    return _ok("all four attributes are validated")
+
+
+def _c92():
+    """the constructor reads the attributes"""
+    body = _method_src(_source()[1], "new")
+    missing = [a for a in ("columns", "rows", "layers", "box_h")
+               if not re.search(rf"self\.{a}\s*=", body)]
+    if missing:
+        return _no(f"new never assigns self.{', self.'.join(missing)}")
+    return _ok("new stores all four")
+
+
+def _c93():
+    """the hard-coded pattern is gone from the class body"""
+    cls = _class(_source()[1])
+    if cls is None:
+        return _no("no Palletizer class found")
+    names = set()
+    for node in cls.body:
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        for t in targets:
+            names.update(n.id for n in ast.walk(t)
+                         if isinstance(n, ast.Name))
+    left = sorted(names & {"columns", "rows", "layers", "box_h"})
+    if left:
+        return _no(f"the class still defines {', '.join(left)}",
+                   "Delete the class-level defaults; they now come from"
+                   " configuration.")
+    return _ok("the class-level defaults are gone")
+
+
+# --- exercise 11: pack on its own
+
+
+def _c111():
+    """autopack is written"""
+    node = _method(_source()[1], "autopack")
+    if node is None:
+        return _no("autopack not found at class level",
+                   "Check the indentation: async def autopack lines up with"
+                   " async def pick.")
+    facts = _body_facts(node)
+    todo = []
+    if "self.swap_tray" not in facts["calls"]:
+        todo.append("TODO 1: await self.swap_tray() when there is no room")
+    if "self.place" not in facts["calls"]:
+        todo.append("TODO 2: await self.place()")
+    if todo:
+        return _no("autopack still has the skeleton in it",
+                   *[f"missing {t}" for t in todo])
+    return _ok("autopack is written")
+
+
+EXERCISES = {
+    "2.1": _c21, "2.2": _c22, "2.3": _c23, "2.4": _c24,
+    "3.1": _c31, "3.2": _c32, "3.3": _c33,
+    "5.1": _c51,
+    "6.1": _c61, "6.2": _c62, "6.3": _c63,
+    "7.1": lambda: _written("place"), "7.2": lambda: _routed("place"),
+    "8.1": lambda: _written("pack"), "8.2": lambda: _routed("pack"),
+    "9.1": _c91, "9.2": _c92, "9.3": _c93,
+    "11.1": _c111, "11.2": lambda: _routed("autopack"),
+}
+
+TITLES = {
+    "7.1": "place is written", "7.2": "do_command routes place",
+    "8.1": "pack is written", "8.2": "do_command routes pack",
+    "11.2": "do_command routes autopack",
+}
+
+
+def _title(cid):
+    if cid in TITLES:
+        return TITLES[cid]
+    return (EXERCISES[cid].__doc__ or cid).strip()
+
+
+def cmd_check_exercise(argv):
+    """Check one exercise, or one numbered step of it."""
+    ap = argparse.ArgumentParser(
+        prog="course-tools check-exercise",
+        description="Check your work on an exercise. `7` runs every check on "
+                    "exercise 7; `7.2` runs just step 2.")
+    ap.add_argument("which", help="an exercise (7) or one step of it (7.2)")
+    args = ap.parse_args(argv)
+    want = args.which.strip()
+
+    if want in EXERCISES:
+        ids = [want]
+    else:
+        ids = [k for k in EXERCISES if k.split(".")[0] == want]
+        ids.sort(key=lambda k: int(k.split(".")[1]))
+        if not ids:
+            have = sorted({k.split(".")[0] for k in EXERCISES}, key=int)
+            die(f"no checks for {want!r}. Exercises with checks: "
+                f"{', '.join(have)}")
+
+    print(term.bold(f"Exercise {ids[0].split('.')[0]}"))
+    failed = False
+    for cid in ids:
+        ok, lines = EXERCISES[cid]()
+        mark = term.pass_() if ok else term.fail()
+        print(f"  {term.bold(cid)}  {mark}  {_title(cid)}")
+        print(f"        {term.dim(lines[0]) if ok else term.red(lines[0])}")
+        for hint in lines[1:]:
+            print(f"        {term.yellow(hint)}")
+        failed = failed or not ok
+    if failed:
+        sys.exit(1)
+
+
+def cmd_start_server(argv):
+    """Start viam-server for your machine again, unless it is already running.
+
+    The deciding lives in the workshop image (persist/viam-server-ctl.sh), not here:
+    this file comes back from a returning learner's archive and can be older than
+    the session, and the agent's post-restore hook must behave exactly like this
+    command does. `--restart` stops the running copy first.
+    """
+    ctl = os.path.join(os.environ.get("WORKSHOP_DIR", "/opt/workshop"),
+                       "persist", "viam-server-ctl.sh")
+    if not os.path.exists(ctl):
+        sys.exit(f"{ctl} is not in this session, so viam-server cannot be started from here.")
+    action = "restart" if "--restart" in argv else "start"
+    os.execvp("bash", ["bash", ctl, action])
+
+
+COMMANDS = {
+    "setup-machine": cmd_setup_machine,
+    "start-server": cmd_start_server,
+    "check-namespace": cmd_check_namespace,
+    "check-names": cmd_check_names,
+    "setup-github": cmd_setup_github,
+    "print-urls": cmd_print_urls,
+    "print-env": cmd_print_env,
+    "print-all": cmd_print_all,
+    "copy-starter-code": cmd_take_starter,
+    "add-model": cmd_describe_model,
+    "namespace": cmd_namespace,
+    "model-id": cmd_model_id,
+    "check-module": cmd_check,
+    "check-exercise": cmd_check_exercise,
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="course-tools", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    # help=SUPPRESS hides the argument, which also removes argparse's
+    # "positional arguments: {add-model,check-exercise,...}" block. The
+    # curated list in the docstring above is the help a learner should read.
+    ap.add_argument("command", nargs="?", choices=sorted(COMMANDS),
+                    help=argparse.SUPPRESS)
+    args, rest = ap.parse_known_args()
+    if not args.command:
+        ap.print_help()
+        return
+    COMMANDS[args.command](rest)
+
+
+if __name__ == "__main__":
+    main()

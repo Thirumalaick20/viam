@@ -1,0 +1,97 @@
+{
+ "modules": [
+  {
+   "type": "registry",
+   "version": "latest",
+   "name": "viam_robotiq-epick",
+   "module_id": "viam:robotiq-epick"
+  }
+ ],
+ "components": [
+  {
+   "attributes": {
+    "arm-model": "ur5e",
+    "simulate-time": true,
+    "speed": 1.5
+   },
+   "model": "rdk:builtin:simulated",
+   "api": "rdk:component:arm",
+   "name": "arm-1",
+   "frame": {
+    "orientation": {
+     "type": "ov_degrees",
+     "value": {
+      "z": 1.0,
+      "y": 0.0,
+      "th": 0.0,
+      "x": 0.0
+     }
+    },
+    "translation": {
+     "z": 150.0,
+     "y": 0.0,
+     "x": 0.0
+    },
+    "parent": "world"
+   }
+  },
+  {
+   "attributes": {
+    "grab_delay_ms": 250.0
+   },
+   "model": "viam:robotiq:simulated-epick-vacuum-gripper",
+   "api": "rdk:component:gripper",
+   "name": "gripper-1",
+   "frame": {
+    "orientation": {
+     "type": "ov_degrees",
+     "value": {
+      "z": 1.0,
+      "y": 0.0,
+      "th": 0.0,
+      "x": 0.0
+     }
+    },
+    "translation": {
+     "z": 196.0,
+     "y": 0.0,
+     "x": 0.0
+    },
+    "parent": "arm-1"
+   }
+  },
+  {
+   "attributes": {},
+   "model": "rdk:builtin:fake",
+   "api": "rdk:component:generic",
+   "name": "floor",
+   "frame": {
+    "translation": {
+     "z": -5.0,
+     "y": 150.0,
+     "x": 50.0
+    },
+    "parent": "world",
+    "geometry": {
+     "type": "box",
+     "z": 10.0,
+     "y": 2500.0,
+     "x": 2700.0
+    }
+   }
+  },
+  {
+   "name": "box-detect",
+   "api": "rdk:component:sensor",
+   "model": "viam:workcell-components:box-detect",
+   "attributes": {
+    "interval_seconds": 12
+   }
+  }
+ ],
+ "fragments": [
+  {
+   "id": "e42007f2-5a18-4dd1-aeb1-9e2d7bfd0df9"
+  }
+ ]
+}
